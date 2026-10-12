@@ -33,15 +33,21 @@ impl Shared {
     }
 }
 
+/// ストリームが使えなくなったときに音声スレッドから呼ばれる。引数はそのストリームの世代。
+type StreamLostHandler = Arc<dyn Fn(u64) + Send + Sync>;
+
 /// 停止中はストリームを保持しない。デバイスを開いたままにするとスリープを妨げるため。
 pub struct Player {
     shared: Arc<Shared>,
     stream: Option<Stream>,
     fade_deadline: Option<Instant>,
+    // 作り直した後に古いストリームから届いた通知を見分けるための番号
+    generation: u64,
+    on_stream_lost: StreamLostHandler,
 }
 
 impl Player {
-    pub fn new(gain: f32) -> Self {
+    pub fn new(gain: f32, on_stream_lost: impl Fn(u64) + Send + Sync + 'static) -> Self {
         Self {
             shared: Arc::new(Shared {
                 gain: AtomicU32::new(gain.clamp(0.0, 1.0).to_bits()),
@@ -49,7 +55,21 @@ impl Player {
             }),
             stream: None,
             fade_deadline: None,
+            generation: 0,
+            on_stream_lost: Arc::new(on_stream_lost),
         }
+    }
+
+    /// 失われたストリームを捨て、再生中だったなら現在の既定デバイスで作り直す。
+    /// 作り直せなければ停止状態になる。
+    pub fn recover(&mut self, generation: u64) -> Result<(), Error> {
+        if generation != self.generation || self.stream.is_none() {
+            return Ok(());
+        }
+        let was_playing = self.is_playing();
+        self.stream = None;
+        self.fade_deadline = None;
+        if was_playing { self.play() } else { Ok(()) }
     }
 
     pub fn is_playing(&self) -> bool {
@@ -73,6 +93,7 @@ impl Player {
         let device = cpal::default_host()
             .default_output_device()
             .ok_or(Error::from(ErrorKind::DeviceNotAvailable))?;
+        self.generation += 1;
         let supported = device.default_output_config()?;
         let config = StreamConfig {
             buffer_size: match supported.buffer_size() {
@@ -128,6 +149,8 @@ impl Player {
         let mut noise = BrownNoise::new(seed());
         // 0 から始めることで再生開始がフェードインになる
         let mut gain = 0.0f32;
+        let on_stream_lost = Arc::clone(&self.on_stream_lost);
+        let generation = self.generation;
 
         device.build_output_stream(
             config,
@@ -139,7 +162,16 @@ impl Player {
                     frame.fill(T::from_sample(sample));
                 }
             },
-            |err| eprintln!("audio stream error: {err}"),
+            move |err: Error| {
+                eprintln!("audio stream error: {err}");
+                // DeviceChanged は既定デバイスへ自動で付け替わった通知なので作り直さない
+                if matches!(
+                    err.kind(),
+                    ErrorKind::DeviceNotAvailable | ErrorKind::StreamInvalidated
+                ) {
+                    on_stream_lost(generation);
+                }
+            },
             None,
         )
     }

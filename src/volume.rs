@@ -10,6 +10,10 @@ impl Volume {
     const MIN: u8 = 5;
     const MAX: u8 = 100;
 
+    pub fn from_percent(percent: u8) -> Self {
+        Volume(percent.clamp(Self::MIN, Self::MAX))
+    }
+
     pub fn percent(self) -> u8 {
         self.0
     }
@@ -64,6 +68,13 @@ mod tests {
         assert!(gains.windows(2).all(|w| w[0] < w[1]));
         assert!(gains[0] > 0.0);
         assert_eq!(Volume(100).gain(), 1.0);
+    }
+
+    #[test]
+    fn from_percent_clamps_into_range() {
+        assert_eq!(Volume::from_percent(0), Volume(5));
+        assert_eq!(Volume::from_percent(42), Volume(42));
+        assert_eq!(Volume::from_percent(255), Volume(100));
     }
 
     #[test]
