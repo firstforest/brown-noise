@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
@@ -20,7 +19,7 @@ const FADE_OUT: Duration = Duration::from_millis(120);
 
 /// 音声コールバックと共有する状態。コールバック内でロックしないよう atomic だけで持つ。
 struct Shared {
-    volume: AtomicU32,
+    gain: AtomicU32,
     fading_out: AtomicBool,
 }
 
@@ -29,7 +28,7 @@ impl Shared {
         if self.fading_out.load(Ordering::Relaxed) {
             0.0
         } else {
-            f32::from_bits(self.volume.load(Ordering::Relaxed))
+            f32::from_bits(self.gain.load(Ordering::Relaxed))
         }
     }
 }
@@ -38,24 +37,38 @@ impl Shared {
 pub struct Player {
     shared: Arc<Shared>,
     stream: Option<Stream>,
+    fade_deadline: Option<Instant>,
 }
 
 impl Player {
-    pub fn new(volume: f32) -> Self {
+    pub fn new(gain: f32) -> Self {
         Self {
             shared: Arc::new(Shared {
-                volume: AtomicU32::new(volume.clamp(0.0, 1.0).to_bits()),
+                gain: AtomicU32::new(gain.clamp(0.0, 1.0).to_bits()),
                 fading_out: AtomicBool::new(false),
             }),
             stream: None,
+            fade_deadline: None,
         }
     }
 
+    pub fn is_playing(&self) -> bool {
+        self.stream.is_some() && self.fade_deadline.is_none()
+    }
+
+    pub fn set_gain(&self, gain: f32) {
+        self.shared
+            .gain
+            .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
     pub fn play(&mut self) -> Result<(), Error> {
+        self.fade_deadline = None;
+        self.shared.fading_out.store(false, Ordering::Relaxed);
         if self.stream.is_some() {
+            // フェードアウト途中なら同じストリームのままフェードインに戻る
             return Ok(());
         }
-        self.shared.fading_out.store(false, Ordering::Relaxed);
 
         let device = cpal::default_host()
             .default_output_device()
@@ -84,14 +97,25 @@ impl Player {
         Ok(())
     }
 
-    /// フェードアウトし終えるまでブロックしてからデバイスを解放する。
+    /// フェードアウトを始める。ストリームの解放は期限を過ぎてから `tick` で行う。
     pub fn stop(&mut self) {
-        if self.stream.is_none() {
+        if !self.is_playing() {
             return;
         }
         self.shared.fading_out.store(true, Ordering::Relaxed);
-        thread::sleep(FADE_OUT);
-        self.stream = None;
+        self.fade_deadline = Some(Instant::now() + FADE_OUT);
+    }
+
+    /// 期限を過ぎたフェードアウトを完了させる。まだ待つ必要があればその期限を返す。
+    pub fn tick(&mut self, now: Instant) -> Option<Instant> {
+        match self.fade_deadline {
+            Some(deadline) if now >= deadline => {
+                self.stream = None;
+                self.fade_deadline = None;
+                None
+            }
+            pending => pending,
+        }
     }
 
     fn build<T>(&self, device: &Device, config: StreamConfig) -> Result<Stream, Error>
