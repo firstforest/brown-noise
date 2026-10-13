@@ -52,3 +52,7 @@ scripts/bundle-macos.sh
 | macOS | `~/Library/LaunchAgents/brown-noise.plist` |
 | Windows | レジストリ `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` |
 | Linux | `~/.config/autostart/brown-noise.desktop` |
+
+## ライセンス
+
+MIT
